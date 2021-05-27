@@ -16,7 +16,7 @@
 use crate::bitcoin::consensus::deserialize;
 use crate::bitcoin::{Address, Network, OutPoint, Transaction, TxOut, Txid};
 use crate::blockchain::{Blockchain, Capability, ConfigurableBlockchain, Progress};
-use crate::database::BatchDatabase;
+use crate::database::{BatchDatabase, DatabaseUtils};
 use crate::descriptor::{get_checksum, IntoWalletDescriptor};
 use crate::wallet::utils::SecpCtx;
 use crate::{Error, FeeRate, KeychainKind, LocalUtxo, TransactionDetails};
@@ -126,9 +126,9 @@ impl Blockchain for RpcBlockchain {
     ) -> Result<(), Error> {
         debug!("sync");
         let current_height = self.get_height()?;
-        let node_synced = self.get_node_synced_height()?;
 
-        //TODO if current_height == node_synced should check only the mempool
+        // block invalidate may cause height to go down
+        let node_synced = self.get_node_synced_height()?.min(current_height);
 
         //TODO if it's a big rescan, spawn a thread that checks getwalletinfo and update progress?
         // maybe better to call rescan in chunks (updating node_synced_height) so that in case of
@@ -141,10 +141,10 @@ impl Blockchain for RpcBlockchain {
             .rescan_blockchain(Some(node_synced as usize), Some(current_height as usize))?;
         progress_update.update(1.0, None)?;
 
-        let known_txs: HashMap<_, _> = db
-            .iter_raw_txs()?
+        let mut known_txs: HashMap<_, _> = db
+            .iter_txs(true)?
             .into_iter()
-            .map(|tx| (tx.txid(), tx))
+            .map(|tx| (tx.txid, tx))
             .collect();
         let known_utxos: HashSet<_> = db.iter_utxos()?.into_iter().collect();
 
@@ -155,7 +155,7 @@ impl Blockchain for RpcBlockchain {
         debug!("current_utxo len {}", current_utxo.len());
         let current_txs = self
             .client
-            .list_transactions(None, None, None, Some(true))?;
+            .list_transactions(None, Some(1_000), None, Some(true))?;
         debug!("current_txs len {}", current_txs.len());
 
         let mut indexes = HashMap::new();
@@ -163,13 +163,22 @@ impl Blockchain for RpcBlockchain {
             indexes.insert(*keykind, db.get_last_index(*keykind)?.unwrap_or(0));
         }
 
-        for tx_result in current_txs {
-            if !known_txs.contains_key(&tx_result.info.txid) {
+        for tx_result in current_txs.iter() {
+            if let Some(mut known_tx) = known_txs.get_mut(&tx_result.info.txid) {
+                if tx_result.info.blockheight != known_tx.height {
+                    // reorg may change tx height
+                    debug!("updating tx height to: {:?}", tx_result.info.blockheight);
+                    known_tx.height = tx_result.info.blockheight;
+                    db.set_tx(&known_tx)?; //TODO batching
+                }
+            } else {
                 let tx_result = self
                     .client
                     .get_transaction(&tx_result.info.txid, Some(true))?;
                 let tx: Transaction = deserialize(&tx_result.hex)?;
 
+                let mut received = 0u64;
+                let mut sent = 0u64;
                 for output in tx.output.iter() {
                     if let Ok(Some((kind, index))) =
                         db.get_path_from_script_pubkey(&output.script_pubkey)
@@ -177,6 +186,13 @@ impl Blockchain for RpcBlockchain {
                         if index > *indexes.get(&kind).unwrap() {
                             indexes.insert(kind, index);
                         }
+                        received += output.value;
+                    }
+                }
+
+                for input in tx.input.iter() {
+                    if let Some(previous_output) = db.get_previous_output(&input.previous_output)? {
+                        sent += previous_output.value;
                     }
                 }
 
@@ -184,13 +200,20 @@ impl Blockchain for RpcBlockchain {
                     transaction: Some(tx),
                     txid: tx_result.info.txid,
                     timestamp: tx_result.info.time,
-                    received: 0,                                                 //TODO
-                    sent: 0,                                                     //TODO
+                    received,
+                    sent,
                     fees: tx_result.fee.map(|f| f.as_sat() as u64).unwrap_or(0), //TODO
                     height: tx_result.info.blockheight,
                 };
                 debug!("saving tx: {}", tx_result.info.txid);
                 db.set_tx(&td)?; //TODO batching
+            }
+        }
+        let current_txs_txid: HashSet<_> = current_txs.iter().map(|c| c.info.txid).collect();
+        for known_txid in known_txs.keys() {
+            if !current_txs_txid.contains(known_txid) {
+                debug!("removing tx: {}", known_txid);
+                db.del_tx(known_txid, false)?; //TODO batching
             }
         }
 
@@ -385,7 +408,7 @@ crate::bdk_blockchain_tests! {
             url,
             auth,
             network: Network::Regtest,
-            wallet_name: "client-wallet-test".to_string(),
+            wallet_name: format!("client-wallet-test-{:?}", std::time::SystemTime::now() ),
             skip_blocks: None,
         };
         RpcBlockchain::from_config(&config).unwrap()
@@ -482,8 +505,8 @@ mod test {
         let db = MemoryDatabase::new();
         let wallet_skip =
             Wallet::new(DESCRIPTOR_PRIV, None, Network::Regtest, db, blockchain_skip).unwrap();
+        wallet_skip.sync(noop_progress(), None).unwrap();
         send_to_address(&bitcoind, &address, 100_000);
-        generate(&bitcoind, 1); // TODO why this is needed even if list_unspent should include zero conf and unsafe?
         wallet_skip.sync(noop_progress(), None).unwrap();
         assert_eq!(wallet_skip.get_balance().unwrap(), 100_000);
     }
