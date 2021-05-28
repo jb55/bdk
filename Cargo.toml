@@ -33,7 +33,7 @@ lazy_static = { version = "1.4", optional = true }
 tiny-bip39 = { version = "^0.8", optional = true }
 
 # Needed by bdk_blockchain_tests macro
-bitcoincore-rpc = {  version = "0.13", optional = true }
+bitcoincore-rpc = { version = "0.13.0", optional = true }
 serial_test = { version = "0.4", optional = true }
 
 # Platform-specific dependencies
@@ -90,3 +90,6 @@ members = ["macros"]
 features = ["compiler", "electrum", "esplora", "compact_filters", "key-value-db", "all-keys"]
 # defines the configuration attribute `docsrs`
 rustdoc-args = ["--cfg", "docsrs"]
+
+[patch.crates-io]
+bitcoincore-rpc = { git = "https://github.com/rust-bitcoin/rust-bitcoincore-rpc/", rev="27dd8bed6625b6bc8c3765a264eb1ce022305431" }  # needs wallet_conflicts not yet released in 0.1

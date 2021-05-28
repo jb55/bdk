@@ -124,11 +124,15 @@ impl Blockchain for RpcBlockchain {
         db: &mut D,
         progress_update: P,
     ) -> Result<(), Error> {
-        debug!("sync");
         let current_height = self.get_height()?;
 
         // block invalidate may cause height to go down
         let node_synced = self.get_node_synced_height()?.min(current_height);
+
+        let mut indexes = HashMap::new();
+        for keykind in &[KeychainKind::External, KeychainKind::Internal] {
+            indexes.insert(*keykind, db.get_last_index(*keykind)?.unwrap_or(0));
+        }
 
         //TODO if it's a big rescan, spawn a thread that checks getwalletinfo and update progress?
         // maybe better to call rescan in chunks (updating node_synced_height) so that in case of
@@ -153,30 +157,37 @@ impl Blockchain for RpcBlockchain {
             .client
             .list_unspent(Some(0), None, None, Some(true), None)?;
         debug!("current_utxo len {}", current_utxo.len());
-        let current_txs = self
+        let list_txs = self
             .client
             .list_transactions(None, Some(1_000), None, Some(true))?;
-        debug!("current_txs len {}", current_txs.len());
+        let mut list_txs_ids = HashSet::new();
 
-        let mut indexes = HashMap::new();
-        for keykind in &[KeychainKind::External, KeychainKind::Internal] {
-            indexes.insert(*keykind, db.get_last_index(*keykind)?.unwrap_or(0));
-        }
-
-        for tx_result in current_txs.iter() {
-            if let Some(mut known_tx) = known_txs.get_mut(&tx_result.info.txid) {
+        for tx_result in list_txs.iter().filter(|t| {
+            // filter out replaced tx => unconfirmed and not in the mempool
+            t.info.confirmations > 0 || self.client.get_mempool_entry(&t.info.txid).is_ok()
+        }) {
+            let txid = tx_result.info.txid;
+            list_txs_ids.insert(txid);
+            if let Some(mut known_tx) = known_txs.get_mut(&txid) {
                 if tx_result.info.blockheight != known_tx.height {
                     // reorg may change tx height
-                    debug!("updating tx height to: {:?}", tx_result.info.blockheight);
+                    debug!(
+                        "updating tx({}) height to: {:?}",
+                        txid, tx_result.info.blockheight
+                    );
                     known_tx.height = tx_result.info.blockheight;
+                    db.set_tx(&known_tx)?; //TODO batching
+                } else if tx_result.detail.fee.unwrap_or_default().as_sat() as u64 != known_tx.fees
+                {
+                    let new_fee = tx_result.detail.fee.unwrap_or_default().as_sat() as u64;
+                    debug!("updating tx({}) fees to: {:?}", txid, new_fee);
+                    known_tx.fees = new_fee;
                     db.set_tx(&known_tx)?; //TODO batching
                 }
             } else {
-                let tx_result = self
-                    .client
-                    .get_transaction(&tx_result.info.txid, Some(true))?;
+                //TODO check there is the raw tx in db?
+                let tx_result = self.client.get_transaction(&txid, Some(true))?;
                 let tx: Transaction = deserialize(&tx_result.hex)?;
-
                 let mut received = 0u64;
                 let mut sent = 0u64;
                 for output in tx.output.iter() {
@@ -202,16 +213,19 @@ impl Blockchain for RpcBlockchain {
                     timestamp: tx_result.info.time,
                     received,
                     sent,
-                    fees: tx_result.fee.map(|f| f.as_sat() as u64).unwrap_or(0), //TODO
+                    fees: tx_result.fee.map(|f| f.as_sat().abs() as u64).unwrap_or(0), //TODO
                     height: tx_result.info.blockheight,
                 };
-                debug!("saving tx: {}", tx_result.info.txid);
+                debug!(
+                    "saving tx: {} tx_result.fee:{:?} td.fees:{:?}",
+                    td.txid, tx_result.fee, td.fees
+                );
                 db.set_tx(&td)?; //TODO batching
             }
         }
-        let current_txs_txid: HashSet<_> = current_txs.iter().map(|c| c.info.txid).collect();
+
         for known_txid in known_txs.keys() {
-            if !current_txs_txid.contains(known_txid) {
+            if !list_txs_ids.contains(known_txid) {
                 debug!("removing tx: {}", known_txid);
                 db.del_tx(known_txid, false)?; //TODO batching
             }
@@ -242,10 +256,10 @@ impl Blockchain for RpcBlockchain {
 
         for (keykind, index) in indexes {
             debug!("{:?} max {}", keykind, index);
-            db.set_last_index(keykind, index)?;
+            db.set_last_index(keykind, index)?; //TODO batching
         }
 
-        self.set_node_synced_height(current_height)?;
+        self.set_node_synced_height(current_height)?; //TODO batching
         Ok(())
     }
 
